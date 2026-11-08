@@ -1,0 +1,326 @@
+import os
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from dotenv import load_dotenv
+from database import Database
+
+load_dotenv()
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+db = Database()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db.add_user(user.id, user.username, user.first_name)
+
+    if context.args:
+        token = context.args[0]
+        owner_id = db.get_owner_by_token(token)
+
+        if owner_id and owner_id != user.id:
+            db.add_friend(user.id, owner_id)
+            owner_info = db.get_user_info(owner_id)
+            owner_name = owner_info[1] if owner_info else "Пользователь"
+
+            await update.message.reply_text(
+                f"✅ {owner_name} добавлен в друзья!\n\n"
+                f"Смотрите его wishlist через /friends"
+            )
+            return
+
+    await update.message.reply_text(
+        f"👋 Привет, {user.first_name}!\n\n"
+        "🎁 Wishlist бот\n\n"
+        "Отправьте текст/фото/видео → добавится хотелка\n"
+        "/list - ваш список\n"
+        "/share - ссылка для друзей\n"
+        "/friends - списки друзей\n"
+        "/help - помощь"
+    )
+
+
+async def add_wish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db.add_user(user.id, user.username, user.first_name)
+
+    wish_text = update.message.text or update.message.caption or ""
+    wish_text = wish_text.strip()
+    photo_id = update.message.photo[-1].file_id if update.message.photo else None
+    video_id = update.message.video.file_id if update.message.video else None
+
+    if not wish_text and not photo_id and not video_id:
+        await update.message.reply_text("❌ Отправьте текст, фото или видео!")
+        return
+
+    wish_id = db.add_wish(user.id, wish_text or "Без описания", photo_id=photo_id, video_id=video_id)
+
+    media_info = ""
+    if photo_id:
+        media_info = " 📷"
+    elif video_id:
+        media_info = " 🎥"
+
+    await update.message.reply_text(
+        f"✅ Хотелка добавлена!{media_info}\n\n"
+        f"📝 {wish_text or 'Без описания'}\n\n"
+        f"Используйте /list чтобы посмотреть список"
+    )
+
+
+async def list_wishes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await show_wishlist(update, context, user.id, is_owner=True)
+
+
+async def show_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       user_id: int, is_owner: bool = False):
+    wishes = db.get_wishes(user_id)
+    user_info = db.get_user_info(user_id)
+    username = user_info[1] if user_info else "Пользователь"
+
+    if not wishes:
+        msg = f"📋 {'Ваш список' if is_owner else f'Список {username}'} пуст."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg)
+        return
+
+    header = f"🎁 {'Ваш wishlist' if is_owner else f'Wishlist: {username}'}\n\n"
+
+    # Проверяем наличие медиа
+    has_media = any(w[2] or w[3] for w in wishes)
+
+    if has_media:
+        # Удаляем сообщение с кнопками если есть
+        if update.callback_query:
+            try:
+                await update.callback_query.delete_message()
+            except:
+                pass
+            target = update.callback_query.message
+        else:
+            target = update.message
+
+        await target.reply_text(header)
+
+        for idx, (wid, text, photo, video, completed, created) in enumerate(wishes, 1):
+            status = "✅" if completed else "⬜"
+            caption = f"{status} {idx}. {text}"
+
+            try:
+                if photo:
+                    msg = await target.reply_photo(photo=photo, caption=caption)
+                elif video:
+                    msg = await target.reply_video(video=video, caption=caption)
+                else:
+                    msg = await target.reply_text(caption)
+
+                # Кнопки для владельца
+                if is_owner:
+                    keyboard = []
+                    if not completed:
+                        keyboard.append([InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{wid}")])
+                    else:
+                        keyboard.append([InlineKeyboardButton("↩️ Вернуть", callback_data=f"undone_{wid}")])
+                    keyboard.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"del_{wid}")])
+                    
+                    await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+            except Exception as e:
+                logger.error(f"Media send error: {e}")
+                await target.reply_text(f"{status} {idx}. {text}")
+    else:
+        # Текстовый список
+        lines = []
+        buttons = []
+        
+        for idx, (wid, text, photo, video, completed, created) in enumerate(wishes, 1):
+            status = "✅" if completed else "⬜"
+            lines.append(f"{status} {idx}. {text}")
+            
+            # Кнопки для каждой хотелки (только для владельца)
+            if is_owner:
+                row = []
+                if not completed:
+                    row.append(InlineKeyboardButton(f"✅ {idx}", callback_data=f"done_{wid}"))
+                else:
+                    row.append(InlineKeyboardButton(f"↩️ {idx}", callback_data=f"undone_{wid}"))
+                row.append(InlineKeyboardButton(f"🗑 {idx}", callback_data=f"del_{wid}"))
+                buttons.append(row)
+
+        msg = header + "\n".join(lines)
+
+        keyboard = buttons if is_owner else []
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                msg,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+            )
+
+async def share_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    wishes = db.get_wishes(user.id)
+
+    if not wishes:
+        await update.message.reply_text("❌ Ваш список пуст!")
+        return
+
+    token = db.create_invitation(user.id)
+    bot_username = (await context.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={token}"
+
+    await update.message.reply_text(
+        f"🔗 Ссылка для друзей:\n\n{link}\n\n"
+        f"Отправьте её друзьям, чтобы они могли видеть ваш список!"
+    )
+
+
+async def friends_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    friends = db.get_friends(user.id)
+
+    if not friends:
+        await update.message.reply_text(
+            "👥 У вас пока нет друзей.\n\n"
+            "Отправьте им ссылку через /share"
+        )
+        return
+
+    keyboard = []
+    for fid, username, fname in friends:
+        name = fname or username or f"User {fid}"
+        keyboard.append([InlineKeyboardButton(f"🎁 {name}", callback_data=f"friend_{fid}")])
+
+    await update.message.reply_text(
+        "👥 Ваши друзья:\n\nВыберите чтобы посмотреть список:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    data = query.data
+
+    # Отметить выполненной
+    if data.startswith("done_"):
+        wid = int(data.split("_")[1])
+        db.mark_completed(user.id, wid, True)
+        await query.answer("✅ Отмечено как выполнено!")
+        
+        # Обновляем кнопки
+        keyboard = [
+            [InlineKeyboardButton("↩️ Вернуть", callback_data=f"undone_{wid}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"del_{wid}")]
+        ]
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Отменить выполнение
+    if data.startswith("undone_"):
+        wid = int(data.split("_")[1])
+        db.mark_completed(user.id, wid, False)
+        await query.answer("↩️ Возвращено в список!")
+        
+        # Обновляем кнопки
+        keyboard = [
+            [InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{wid}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"del_{wid}")]
+        ]
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Удалить хотелку
+    if data.startswith("del_"):
+        wid = int(data.split("_")[1])
+        db.delete_wish(user.id, wid)
+        await query.answer("🗑 Хотелка удалена!")
+        
+        try:
+            await query.message.delete()
+        except:
+            await query.edit_message_text("🗑 Хотелка удалена")
+        return
+
+    # Просмотр друга
+    if data.startswith("friend_"):
+        fid = int(data.split("_")[1])
+
+        if not db.are_friends(user.id, fid):
+            await query.edit_message_text("❌ Не в списке друзей")
+            return
+
+        wishes = db.get_wishes(fid)
+        if not wishes:
+            await query.edit_message_text("📋 Список друга пуст")
+            return
+
+        await show_wishlist(update, context, fid, is_owner=False)
+        return
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📚 Помощь:\n\n"
+        "Отправьте текст, фото или видео → добавится хотелка\n\n"
+        "**Команды:**\n"
+        "• /list - ваш список\n"
+        "• /share - ссылка для друзей\n"
+        "• /friends - списки друзей\n\n"
+        "**В списке:**\n"
+        "• ✅ - отметить выполненным\n"
+        "• 🗑 - удалить хотелку\n"
+        "• ↩️ - вернуть в список\n\n"
+        "🎁 Делитесь списками с друзьями!",
+        parse_mode='Markdown'
+    )
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Error: {context.error}", exc_info=context.error)
+
+
+def main():
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not found!")
+        return
+
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("list", list_wishes))
+    app.add_handler(CommandHandler("share", share_list))
+    app.add_handler(CommandHandler("friends", friends_menu))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND,
+        add_wish_handler
+    ))
+    app.add_error_handler(error_handler)
+
+    logger.info("Bot started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
